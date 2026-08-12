@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NordVPN Tray
+Comment=VPN state switcher, kill switch control and honest tunnel status
+Exec=bash -c "sleep 8 && exec /home/zenko/.local/bin/nordvpn-tray"
+X-GNOME-Autostart-enabled=true
+Hidden=false
+NoDisplay=false

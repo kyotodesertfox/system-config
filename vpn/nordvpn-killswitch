@@ -1,0 +1,80 @@
+#!/bin/bash
+# /usr/local/sbin/nordvpn-killswitch
+#
+# arm | disarm | status  for the fail-closed nftables kill switch.
+#
+# The switch itself is a ruleset (nordvpn-killswitch.nft), not a program. This
+# is the interface the tray calls, so that "Disconnect" and "Go Unprotected"
+# mean different things:
+#
+#   Disconnect       tunnel down, switch stays ARMED    -> LAN only
+#   Go Unprotected   tunnel down, switch DISARMED       -> clear text
+#
+# ARMED IS THE DEFAULT AND DISARM DOES NOT SURVIVE A REBOOT. Boot always comes
+# up armed, so forgetting cannot leave the machine silently exposed - that was
+# an explicit decision, not an accident of implementation.
+#
+# DISARM ALSO SWAPS DNS. The configured resolvers are NordVPN's, reachable only
+# inside the tunnel, so disarming without changing them leaves routing working
+# and nothing resolving - which looks like a broken machine rather than a
+# deliberate state. Public resolvers are written while disarmed and removed on
+# re-arm.
+#
+# Exit codes, because the tray reads them:
+#   status -> 0 armed, 1 not armed
+
+set -uo pipefail
+
+RULES=/etc/nftables.d/nordvpn-killswitch.nft
+TABLE="inet killswitch"
+REFRESH=/usr/local/sbin/nordvpn-api-refresh
+RESOLV=/etc/resolv.conf
+MARK="# nordvpn-killswitch disarmed"
+PUBLIC_DNS=("1.1.1.1" "8.8.8.8")
+
+need_root() { [ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 2; }; }
+armed() { nft list table $TABLE >/dev/null 2>&1; }
+
+case "${1:-status}" in
+
+  status)
+    if armed; then echo "armed"; exit 0; else echo "disarmed"; exit 1; fi
+    ;;
+
+  arm)
+    need_root
+    [ -r "$RULES" ] || { echo "missing $RULES" >&2; exit 2; }
+    nft -f "$RULES" || { echo "failed to load ruleset" >&2; exit 2; }
+
+    # Remove any public resolvers written by a previous disarm.
+    if grep -q "$MARK" "$RESOLV" 2>/dev/null; then
+      TMP=$(mktemp); grep -v "$MARK" "$RESOLV" > "$TMP"
+      install -m 644 "$TMP" "$RESOLV"; rm -f "$TMP"
+    fi
+
+    # Populate the API set so recovery is possible. Only succeeds while the
+    # tunnel is up, which is the correct condition - see nordvpn-api-refresh.
+    [ -x "$REFRESH" ] && "$REFRESH" >/dev/null 2>&1
+
+    echo "armed"
+    ;;
+
+  disarm)
+    need_root
+    nft delete table $TABLE 2>/dev/null
+
+    # Without this, routing works and nothing resolves.
+    if ! grep -q "$MARK" "$RESOLV" 2>/dev/null; then
+      for d in "${PUBLIC_DNS[@]}"; do
+        echo "nameserver $d $MARK" >> "$RESOLV"
+      done
+    fi
+
+    echo "disarmed - traffic is in clear text"
+    ;;
+
+  *)
+    echo "usage: nordvpn-killswitch {arm|disarm|status}" >&2
+    exit 2
+    ;;
+esac

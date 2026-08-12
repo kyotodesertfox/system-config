@@ -1,0 +1,120 @@
+#!/bin/bash
+# /etc/NetworkManager/dispatcher.d/90-nordvpn-verify
+#
+# WHY THIS EXISTS
+#
+# The nordvpn connection pins one specific WireGuard server. NordVPN rotates and
+# retires servers on their own schedule and nothing tells us. When the pinned one
+# goes away the connection still comes up "activated", because bringing up a
+# WireGuard interface never requires the far end to exist - there is no connection
+# to fail. So it reports healthy and carries no traffic. That is why this breaks
+# every few days and always looks like a mystery.
+#
+# The credential is not the problem. The account-bound private key does not
+# expire. Only the server address goes stale.
+#
+# WHAT IT DOES
+#
+# Fires when the tunnel comes up, waits for a real WireGuard handshake, and if
+# none arrives tries the next recommended server until one answers or the list is
+# exhausted. No timer, no polling - it runs only at the moment failure is
+# possible.
+#
+# The handshake is the signal rather than an API query because it is ground truth:
+# it catches a retired server, a dead server, a blocked port and a captive network
+# identically. An API query only catches the first.
+#
+# All netplan editing is delegated to /usr/local/bin/nordvpn-repin, which parses
+# the YAML and makes three coordinated edits or refuses. An earlier version did it
+# with sed, and every pattern silently matched nothing against the real file.
+
+ACTION="$2"
+CONN="nordvpn"
+REPIN="/usr/local/bin/nordvpn-repin"
+TOKEN_FILE="/home/zenko/.nordvpn-token.sh"
+LOCK="/run/nordvpn-verify.lock"
+LOG="/var/log/nordvpn-verify.log"
+WAIT=15          # seconds to wait for a handshake
+MAX_TRIES=5      # candidate servers to try
+
+log() { echo "$(date -Is) $*" >> "$LOG"; }
+
+# Only when our connection comes up.
+[ "$ACTION" = "up" ] || exit 0
+[ "$CONNECTION_ID" = "$CONN" ] || exit 0
+
+# This script calls `nmcli connection up`, which re-fires the dispatcher.
+# Without this guard it recurses forever.
+exec 9>"$LOCK" || exit 0
+flock -n 9 || { log "already running, skipping"; exit 0; }
+
+handshake_ok() {
+  local hs age
+  hs=$(wg show "$CONN" latest-handshakes 2>/dev/null | awk '{print $2}' | head -1)
+  [ -n "$hs" ] && [ "$hs" -gt 0 ] 2>/dev/null || return 1
+  age=$(( $(date +%s) - hs ))
+  [ "$age" -lt 180 ]
+}
+
+wait_for_handshake() {
+  local i
+  for i in $(seq 1 "$WAIT"); do
+    handshake_ok && return 0
+    sleep 1
+  done
+  return 1
+}
+
+if wait_for_handshake; then
+  log "handshake ok - tunnel is live"
+  exit 0
+fi
+
+log "NO HANDSHAKE after ${WAIT}s - pinned server is not answering"
+
+[ -x "$REPIN" ]       || { log "$REPIN missing or not executable - giving up"; exit 0; }
+[ -r "$TOKEN_FILE" ]  || { log "cannot read $TOKEN_FILE - giving up"; exit 0; }
+# shellcheck disable=SC1090
+. "$TOKEN_FILE"
+[ -n "$NORDVPN_ACCESS_TOKEN" ] || { log "no token in $TOKEN_FILE - giving up"; exit 0; }
+
+RECS=$(curl -sf --max-time 20 \
+  -H "Authorization: token:$NORDVPN_ACCESS_TOKEN" \
+  "https://api.nordvpn.com/v1/servers/recommendations?filters%5Bservers_technologies%5D%5Bidentifier%5D=wireguard_udp&limit=${MAX_TRIES}")
+[ -n "$RECS" ] || { log "recommendations API returned nothing - giving up"; exit 0; }
+
+COUNT=$(echo "$RECS" | jq 'length' 2>/dev/null)
+[ -n "$COUNT" ] && [ "$COUNT" -gt 0 ] 2>/dev/null || { log "could not parse recommendations"; exit 0; }
+log "trying up to $COUNT candidates"
+
+i=0
+while [ "$i" -lt "$COUNT" ]; do
+  HOST=$(echo "$RECS" | jq -r ".[$i].hostname")
+  IP=$(echo "$RECS"   | jq -r ".[$i].station")
+  KEY=$(echo "$RECS"  | jq -r ".[$i].technologies[]
+        | select(.identifier==\"wireguard_udp\")
+        | .metadata[] | select(.name==\"public_key\") | .value")
+  i=$((i + 1))
+
+  [ -n "$IP" ] && [ -n "$KEY" ] && [ "$KEY" != "null" ] || continue
+
+  # The parser makes all three edits or fails. It never half-writes.
+  if ! "$REPIN" --set "$IP" "$KEY" >>"$LOG" 2>&1; then
+    log "repin refused for $HOST - stopping rather than retrying blind"
+    exit 0
+  fi
+
+  log "repinned to $HOST ($IP) - applying"
+  netplan apply >/dev/null 2>&1
+  sleep 2
+  nmcli connection up "$CONN" >/dev/null 2>&1
+
+  if wait_for_handshake; then
+    log "SUCCESS on $HOST ($IP) - exit IP is now this server"
+    exit 0
+  fi
+  log "$HOST did not handshake either"
+done
+
+log "all $COUNT candidates failed - config left at the last one tried"
+exit 0

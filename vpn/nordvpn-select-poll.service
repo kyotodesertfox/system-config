@@ -1,0 +1,26 @@
+[Unit]
+Description=NordVPN health check - heal a dead server, rebalance only if genuinely congested
+Documentation=file:///usr/local/sbin/nordvpn-select
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nordvpn-select --poll
+
+# A poll that hangs must not stack up behind the next one.
+TimeoutStartSec=180
+
+# It needs root for `wg set` and the netplan source, and network for the API.
+# Nothing else, so take away what it does not use.
+PrivateTmp=true
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+RestrictRealtime=true
+NoNewPrivileges=true
+
+# Exit 1 means "nothing to do" - staying put, no state recorded, API
+# unreachable. That is a normal outcome, not a failure, and must not show as
+# a failed unit or it trains you to ignore the status.
+SuccessExitStatus=0 1

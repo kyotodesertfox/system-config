@@ -1,0 +1,21 @@
+[Unit]
+Description=Hourly NordVPN health check
+Documentation=file:///usr/local/sbin/nordvpn-select
+
+[Timer]
+OnCalendar=hourly
+
+# Catch up after suspend or a reboot rather than silently skipping. A laptop
+# that was closed for six hours should check on waking, which is exactly when
+# a pinned server is most likely to have gone away.
+Persistent=true
+
+# Do not hit NordVPN's API at :00 with everyone else, and do not make the
+# switch time predictable.
+RandomizedDelaySec=300
+
+# Survives a missed run without drifting.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

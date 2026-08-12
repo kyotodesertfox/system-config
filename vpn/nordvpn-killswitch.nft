@@ -1,0 +1,91 @@
+#!/usr/sbin/nft -f
+#
+# /etc/nftables.d/nordvpn-killswitch.nft
+#
+# Fail-closed VPN kill switch. If traffic is not leaving through the tunnel,
+# it does not leave.
+#
+# WHY A SEPARATE TABLE
+# --------------------
+# Docker owns `table ip filter` and `table ip nat` via iptables-nft and warns
+# not to touch them. nftables evaluates every table independently and a DROP in
+# any of them drops the packet, so this lives in its own `inet` table and never
+# edits Docker's.
+#
+# POLICY IS DROP, NOT ACCEPT
+# --------------------------
+# With `policy accept` plus explicit drops, anything not thought of leaks. With
+# `policy drop` plus explicit accepts, anything not thought of breaks. Breaking
+# gets noticed and fixed. Leaking does not.
+#
+# THE RECOVERY DEADLOCK, AND HOW IT IS SOLVED
+# -------------------------------------------
+# The switch would otherwise block the thing that repairs the tunnel:
+# nordvpn-select heals by asking api.nordvpn.com for a live server over 443,
+# and with the tunnel down both 443 and DNS are dropped. Armed at exactly the
+# moment it prevents the fix - and a retired server is the failure that started
+# all of this.
+#
+# Fixed WITHOUT opening DNS, by caching while healthy:
+#   - the `nordvpn_api` set below holds the API's current addresses
+#   - nordvpn-api-refresh updates that set AND /etc/hosts while the tunnel is up
+#   - when the tunnel drops, both are already current, so recovery needs no
+#     lookup at all
+#
+# The addresses are Cloudflare edge IPs. They rotate, which is why the set is
+# refreshed rather than hardcoded. They are also shared infrastructure, so this
+# hole technically permits reaching anything Cloudflare fronts if something
+# deliberately targets those IPs with another SNI. That is a targeted-abuse
+# path, not a passive leak, and it is the price of being able to recover.
+#
+# TO REMOVE:   nft delete table inet killswitch
+# TO INSPECT:  nft list table inet killswitch
+
+table inet killswitch {
+
+  # Populated by nordvpn-api-refresh. Empty here on purpose - a stale hardcoded
+  # address would fail silently at the worst moment.
+  set nordvpn_api {
+    type ipv4_addr
+    flags interval
+    comment "api.nordvpn.com - refreshed while the tunnel is healthy"
+  }
+
+  chain output {
+    type filter hook output priority 0; policy drop;
+
+    oif "lo" accept
+    oifname "nordvpn" accept
+
+    # LAN. Never leaves the house, so not a leak. Removing this costs the Pi.
+    ip  daddr 192.168.12.0/24 accept
+    ip6 daddr fe80::/10 accept
+
+    # The WireGuard handshake itself. WITHOUT THIS THE TUNNEL CAN NEVER COME
+    # BACK - the switch would block the thing that unblocks it. Any address,
+    # so repinning to a new endpoint still works.
+    udp dport 51820 accept
+
+    # The recovery hole. Only 443, only to the cached API addresses.
+    tcp dport 443 ip daddr @nordvpn_api accept
+
+    # DHCP client - needed to get an address on the physical NIC at all.
+    udp sport 68 udp dport 67 accept
+
+    counter comment "dropped-egress"
+  }
+
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+
+    # Containers and anything else forwarded may only leave via the tunnel.
+    oifname "nordvpn" accept
+    ct state established,related accept
+
+    # Traffic staying on the local bridges never leaves the host.
+    iifname "docker0"         oifname "docker0"         accept
+    iifname "br-41a69b83588d" oifname "br-41a69b83588d" accept
+
+    counter comment "dropped-forward"
+  }
+}

@@ -1,0 +1,80 @@
+#!/bin/bash
+# /usr/local/sbin/nordvpn-api-refresh
+#
+# Keep the kill switch's recovery hole usable.
+#
+# THE PROBLEM
+# -----------
+# With the kill switch armed and the tunnel down, DNS is dropped - the only
+# resolvers configured are NordVPN's, reachable solely inside the tunnel. So at
+# the exact moment nordvpn-select needs to ask api.nordvpn.com for a live
+# server, it can neither resolve the name nor reach the address.
+#
+# THE FIX
+# -------
+# Cache while healthy. This runs WHILE THE TUNNEL IS UP, resolves the API, and
+# writes the result to two places:
+#
+#   1. the nftables set `nordvpn_api`  - so 443 to those addresses is permitted
+#   2. /etc/hosts                      - so no lookup is needed to use them
+#
+# When the tunnel later drops, both are already correct and recovery needs no
+# DNS at all.
+#
+# WHY IT REFUSES TO RUN WITH THE TUNNEL DOWN
+# ------------------------------------------
+# A resolution attempted while broken would either fail, or - worse - succeed
+# via some fallback path and cache an answer obtained outside the tunnel. The
+# whole point is that nothing resolves outside the tunnel, so this declines
+# rather than producing a result it cannot vouch for.
+#
+# Run hourly alongside nordvpn-select --poll, and after any successful connect.
+
+set -uo pipefail
+
+HOST=api.nordvpn.com
+TABLE="inet killswitch"
+SET=nordvpn_api
+HOSTS=/etc/hosts
+MARK="# nordvpn-api-refresh"
+
+log() { echo "$(date -Is) $*"; }
+
+[ "$(id -u)" -eq 0 ] || { log "must run as root"; exit 2; }
+
+# Only cache answers obtained through the tunnel.
+if ! ip link show nordvpn >/dev/null 2>&1; then
+  log "tunnel interface absent - refusing to refresh"
+  exit 1
+fi
+DEV=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+if [ "$DEV" != "nordvpn" ]; then
+  log "traffic is not routing via the tunnel (dev=$DEV) - refusing to refresh"
+  exit 1
+fi
+
+IPS=$(getent ahostsv4 "$HOST" 2>/dev/null | awk '{print $1}' | sort -u)
+[ -n "$IPS" ] || { log "could not resolve $HOST - leaving the previous cache intact"; exit 1; }
+
+# 1. nftables set. Flush and repopulate in one go; if the table is not loaded
+#    this is a no-op rather than an error, so the script is safe to run whether
+#    or not the switch is armed.
+if nft list table $TABLE >/dev/null 2>&1; then
+  nft flush set $TABLE $SET 2>/dev/null
+  for ip in $IPS; do nft add element $TABLE $SET "{ $ip }" 2>/dev/null; done
+  log "nft set $SET := $(echo $IPS | tr '\n' ' ')"
+else
+  log "kill switch table not loaded - skipping the nft update"
+fi
+
+# 2. /etc/hosts, so recovery needs no lookup. Only the first address is written;
+#    a hosts file cannot express a set, and any one of them answers.
+FIRST=$(echo "$IPS" | head -1)
+TMP=$(mktemp)
+grep -v "$MARK" "$HOSTS" > "$TMP"
+echo "$FIRST $HOST $MARK" >> "$TMP"
+install -m 644 -o root -g root "$TMP" "$HOSTS"
+rm -f "$TMP"
+log "hosts: $FIRST $HOST"
+
+exit 0

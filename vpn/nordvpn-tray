@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""
+~/.local/bin/nordvpn-tray
+
+WHAT CHANGED AND WHY
+--------------------
+The previous version kept one pinned server per state in
+~/.local/share/nordvpn-states/<state>.yaml and switched by copying that file
+over the netplan config. Two defects, both real:
+
+1. Every stored endpoint is an outage with a timer on it. NordVPN retires
+   servers on their own schedule and tells nobody. colorado.yaml pinned
+   212.102.45.117, which was withdrawn, so that menu entry silently failed
+   while georgia.yaml kept working purely by luck of the draw.
+
+2. Switching did `nmcli connection down` then `up`. NetworkManager tears down
+   policy rules 31000/31001 and table 52311 the instant the connection goes
+   down, which uncovers main's default route via the physical NIC. So every
+   state switch opened a window where traffic left in CLEAR TEXT. Not a brief
+   drop - a brief total bypass.
+
+Both are fixed by delegating to /usr/local/sbin/nordvpn-select, which resolves
+a live server at switch time and swaps the WireGuard peer in place. The
+interface never goes down, so the policy rules are never torn down, and
+packets sent mid-swap die in the tunnel device instead of escaping.
+
+THE TWO DISCONNECTS ARE DELIBERATELY DIFFERENT ACTIONS
+------------------------------------------------------
+A firewall cannot tell a deliberate disconnect from a crash - the interface is
+simply gone either way. So rather than guess, the intent is expressed in which
+menu item is clicked:
+
+  Disconnect       tunnel down, kill switch STAYS ARMED  -> LAN only, no internet
+  Go Unprotected   tunnel down, kill switch DISARMED     -> normal clear text
+
+Connecting to any state re-arms. Disarm never survives a reboot: boot always
+comes up armed, so forgetting cannot leave the machine silently exposed.
+
+"Go Unprotected" is named for what it does. An earlier draft called it "Hard
+Kill", which reads as MORE protection - the one item that reaches clear text
+should not look like the safest option at 2am.
+
+DEPENDENCIES
+------------
+  /usr/local/sbin/nordvpn-select      required - resolves and swaps
+  /usr/local/sbin/nordvpn-killswitch  optional - if absent, the kill-switch
+                                      items are shown insensitive rather than
+                                      silently doing nothing
+
+Both need passwordless sudo for this user; see the sudoers block in the notes.
+
+WHY WORK HAPPENS OFF THE MAIN THREAD
+------------------------------------
+A state switch performs network calls and waits up to ~12s for a handshake.
+Running that inline freezes the whole menu, which looks like a crash. Actions
+run in a worker thread and post results back with GLib.idle_add.
+"""
+
+import os
+import shutil
+import subprocess
+import threading
+
+import gi
+
+gi.require_version('AyatanaAppIndicator3', '0.1')
+gi.require_version('Gtk', '3.0')
+from gi.repository import AyatanaAppIndicator3, GLib, Gtk  # noqa: E402
+
+CONN = 'nordvpn'
+IFACE = 'nordvpn'
+PROBE = '1.1.1.1'
+POLL_MS = 5000
+
+def _find(name, candidates):
+    """Locate a helper wherever it was actually installed.
+
+    Hardcoding one path meant that with the binary absent, `--list` returned
+    nothing and the tray rendered an EMPTY submenu - looking fine and doing
+    nothing, which is the precise failure this tooling exists to eliminate.
+    """
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return shutil.which(name)
+
+
+SELECT = _find('nordvpn-select', [
+    '/usr/local/sbin/nordvpn-select',
+    '/usr/local/bin/nordvpn-select',
+])
+KILLSWITCH = _find('nordvpn-killswitch', [
+    '/usr/local/sbin/nordvpn-killswitch',
+    '/usr/local/bin/nordvpn-killswitch',
+])
+
+
+# --------------------------------------------------------------------- state
+
+def run(cmd, timeout=90):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return subprocess.CompletedProcess(cmd, 1, '', str(e))
+
+
+def route_dev():
+    """Which interface a packet to the internet would ACTUALLY leave by.
+
+    Asks the kernel rather than asking NetworkManager. `nmcli connection show
+    --active` reports the connection as up even when the pinned peer is dead
+    and nothing is moving - it is precisely the indicator that lies during the
+    failure this tooling exists to catch. Routing cannot lie about which
+    device a packet takes.
+    """
+    r = run(['ip', 'route', 'get', PROBE], timeout=5)
+    parts = r.stdout.split()
+    for i, p in enumerate(parts):
+        if p == 'dev' and i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
+def iface_exists():
+    return run(['ip', 'link', 'show', IFACE], timeout=5).returncode == 0
+
+
+def killswitch_armed():
+    """None means the tool is not installed - distinct from 'not armed'."""
+    if KILLSWITCH is None:
+        return None
+    r = run([KILLSWITCH, 'status'], timeout=10)
+    if r.returncode == 1:
+        return False
+    if r.returncode == 0:
+        return True
+    return None
+
+
+def status():
+    """Three states the user actually cares about, not two.
+
+    ROUTED is not the same as CONNECTED: the handshake is what proves the peer
+    answers, and reading it needs root. Rather than claim a healthy tunnel that
+    was never verified, this reports what it can actually see.
+    """
+    dev = route_dev()
+    if not iface_exists():
+        return 'unprotected' if dev else 'down'
+    if dev != IFACE:
+        return 'leak'
+    return 'routed'
+
+
+# -------------------------------------------------------------------- actions
+
+def in_worker(fn):
+    """Run off the main loop; a state switch can block for ~12s."""
+    def wrapper(*_args):
+        set_busy(True)
+        threading.Thread(target=lambda: _finish(fn), daemon=True).start()
+    return wrapper
+
+
+def _finish(fn):
+    try:
+        fn()
+    finally:
+        GLib.idle_add(set_busy, False)
+        GLib.idle_add(refresh)
+
+
+def do_connect_state(name):
+    if SELECT is None:
+        return
+    # nordvpn-select re-arms the kill switch itself on success; arming here too
+    # is harmless and covers the case where it was disarmed by Go Unprotected.
+    if KILLSWITCH_PRESENT:
+        run(['sudo', '-n', KILLSWITCH, 'arm'])
+    run(['sudo', '-n', SELECT, '--state', name])
+
+
+def do_disconnect():
+    """Tunnel down, protection stays on. LAN reachable, internet is not."""
+    run(['nmcli', 'connection', 'down', CONN])
+
+
+def do_unprotected():
+    """The only path to clear text, and it is named for that.
+
+    Order matters: drop the tunnel first, then disarm. Disarming while the
+    tunnel is still up would briefly leave both the firewall down and traffic
+    still tunnelled, which is a state nobody asked for.
+    """
+    run(['nmcli', 'connection', 'down', CONN])
+    if KILLSWITCH_PRESENT:
+        run(['sudo', '-n', KILLSWITCH, 'disarm'])
+
+
+def do_reconnect():
+    if KILLSWITCH_PRESENT:
+        run(['sudo', '-n', KILLSWITCH, 'arm'])
+    run(['nmcli', 'connection', 'up', CONN])
+
+
+# ----------------------------------------------------------------------- menu
+
+def states():
+    """States come from the selector, never from a stored file.
+
+    --list needs no root and no network; it prints the local state->city table.
+    Returns [] when the selector is missing, and the menu then says so rather
+    than showing an empty submenu that looks functional.
+    """
+    if SELECT is None:
+        return []
+    r = run([SELECT, '--list'], timeout=15)
+    return [x for x in r.stdout.split('\n') if x.strip()]
+
+
+def set_busy(busy):
+    for item in (connect_item, disconnect_item, unprotected_item, state_item):
+        item.set_sensitive(not busy)
+    if busy:
+        status_item.set_label('working...')
+    return False
+
+
+def refresh():
+    st = status()
+    armed = killswitch_armed() if KILLSWITCH_PRESENT else None
+
+    icon, text = {
+        'routed':      ('network-vpn', 'VPN up'),
+        'leak':        ('network-vpn-disabled', 'NO TUNNEL - traffic in clear text'),
+        'down':        ('network-vpn-disabled', 'tunnel down'),
+        'unprotected': ('network-vpn-disabled', 'unprotected'),
+    }[st]
+
+    if st != 'routed':
+        if armed is True:
+            text = 'tunnel down - kill switch ARMED (LAN only)'
+        elif armed is False:
+            text = 'UNPROTECTED - clear text'
+
+    indicator.set_icon_full(icon, 'NordVPN')
+    status_item.set_label(text)
+
+    connect_item.set_sensitive(st != 'routed')
+    disconnect_item.set_sensitive(st == 'routed')
+    return True
+
+
+KILLSWITCH_PRESENT = KILLSWITCH is not None
+
+indicator = AyatanaAppIndicator3.Indicator.new(
+    'nordvpn-tray',
+    'network-vpn-disabled',
+    AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+)
+indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+
+menu = Gtk.Menu()
+
+status_item = Gtk.MenuItem(label='...')
+status_item.set_sensitive(False)
+menu.append(status_item)
+menu.append(Gtk.SeparatorMenuItem())
+
+state_menu = Gtk.Menu()
+_names = states()
+if _names:
+    for name in _names:
+        it = Gtk.MenuItem(label=name)
+        it.connect('activate', in_worker(lambda n=name: do_connect_state(n)))
+        state_menu.append(it)
+else:
+    # Say why. An empty submenu is indistinguishable from a broken one.
+    why = ('nordvpn-select not installed'
+           if SELECT is None else 'nordvpn-select --list returned nothing')
+    it = Gtk.MenuItem(label=why)
+    it.set_sensitive(False)
+    state_menu.append(it)
+state_menu.show_all()
+
+state_item = Gtk.MenuItem(label='Connect by State')
+state_item.set_submenu(state_menu)
+state_item.set_sensitive(bool(_names))
+menu.append(state_item)
+
+connect_item = Gtk.MenuItem(label='Reconnect')
+connect_item.connect('activate', in_worker(do_reconnect))
+menu.append(connect_item)
+
+menu.append(Gtk.SeparatorMenuItem())
+
+disconnect_item = Gtk.MenuItem(label='Disconnect  (kill switch stays on)')
+disconnect_item.connect('activate', in_worker(do_disconnect))
+menu.append(disconnect_item)
+
+unprotected_item = Gtk.MenuItem(label='Go Unprotected  (clear text)')
+unprotected_item.connect('activate', in_worker(do_unprotected))
+unprotected_item.set_sensitive(KILLSWITCH_PRESENT)
+menu.append(unprotected_item)
+
+menu.append(Gtk.SeparatorMenuItem())
+
+quit_item = Gtk.MenuItem(label='Quit')
+quit_item.connect('activate', Gtk.main_quit)
+menu.append(quit_item)
+
+menu.show_all()
+indicator.set_menu(menu)
+
+refresh()
+GLib.timeout_add(POLL_MS, refresh)
+
+Gtk.main()

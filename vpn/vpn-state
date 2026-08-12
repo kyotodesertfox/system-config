@@ -1,0 +1,80 @@
+#!/bin/bash
+# /usr/local/bin/vpn-state
+#
+# One word for conky describing what the network is ACTUALLY doing.
+#
+# WHY NOT `nmcli con show --active`
+# --------------------------------
+# That is what conky reads today and it is the one thing that lies during the
+# failure that actually happens. Bringing up a WireGuard interface never
+# requires the far end to exist - there is no connection to fail - so when the
+# pinned server is retired the connection still reports "activated" and carries
+# nothing. The indicator says CONNECTED while nothing works.
+#
+# THE TWO REAL FAILURES, WHICH LOOK NOTHING ALIKE
+# -----------------------------------------------
+# LEAK    - the tunnel is gone and traffic is going out the physical NIC in
+#           clear text. Routing has fallen back to main's default route.
+#           This is the dangerous one and it is SILENT: the internet works
+#           perfectly, which is why nothing ever alerts on it.
+#
+# STALLED - routing still points into the tunnel but the peer is not
+#           answering. Nothing leaks; nothing moves either. This is the
+#           retired-server failure, and it presents as "the internet is
+#           broken" rather than as a VPN problem.
+#
+# Those need opposite responses, so they get different words.
+#
+# HOW IT DECIDES
+# --------------
+# Routing: `ip route get` asks the kernel which interface a packet to the
+# internet would actually leave by, applying the policy rules (31000/31001)
+# rather than assuming them. If that answer is not the wg device, traffic is
+# leaving in clear text right now.
+#
+# Liveness: the latest handshake age. Ground truth - it catches a retired
+# server, a dead server, a blocked port and a captive network identically,
+# where an API query only catches the first. WireGuard refreshes roughly every
+# two minutes, so older than three means the peer stopped answering.
+
+IFACE=nordvpn
+PROBE=1.1.1.1
+STALE=180
+
+route_dev=$(ip route get "$PROBE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+
+# No wg device at all: everything is in clear text.
+if ! ip link show "$IFACE" >/dev/null 2>&1; then
+    echo "LEAK (no tunnel, out via ${route_dev:-?})"
+    exit 2
+fi
+
+# Device exists but routing bypasses it. NetworkManager tears down the policy
+# rules when the connection goes down, uncovering main's default route.
+if [ "$route_dev" != "$IFACE" ]; then
+    echo "LEAK (out via ${route_dev:-?})"
+    exit 2
+fi
+
+# `wg show` needs root to read handshakes. Without it, report honestly rather
+# than reporting OK - claiming a healthy tunnel we did not verify is the exact
+# failure this script exists to correct.
+hs=$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')
+if [ -z "$hs" ]; then
+    echo "ROUTED (handshake unreadable, needs root)"
+    exit 3
+fi
+
+if [ "$hs" -eq 0 ] 2>/dev/null; then
+    echo "STALLED (never handshaked)"
+    exit 1
+fi
+
+age=$(( $(date +%s) - hs ))
+if [ "$age" -gt "$STALE" ]; then
+    echo "STALLED (${age}s since handshake)"
+    exit 1
+fi
+
+echo "OK (${age}s)"
+exit 0

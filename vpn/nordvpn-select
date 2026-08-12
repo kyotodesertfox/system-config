@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""
+/usr/local/sbin/nordvpn-select
+
+Pick a live, lightly-loaded NordVPN WireGuard server in a given US state and
+move the tunnel onto it WITHOUT dropping the interface.
+
+WHY THIS EXISTS
+---------------
+The old design stored a pinned server per state, in
+~/.local/share/nordvpn-states/<state>.yaml. Every stored endpoint is an outage
+with a timer on it: NordVPN retires servers on their own schedule and tells
+nobody. colorado.yaml pinned 212.102.45.117, which was withdrawn, so that menu
+entry failed while georgia.yaml kept working purely by luck of the draw.
+Storing a server is the bug. This resolves one at switch time instead.
+
+WHY `wg set` AND NOT nmcli down/up
+----------------------------------
+The connection's routing is:
+
+    31000: from all lookup main suppress_prefixlength 0
+    31001: not from all fwmark 0xcc57 lookup 52311
+    table 52311: default dev nordvpn
+    main:        default via 192.168.12.1 dev enxf8b46a8d5cdf
+
+While the tunnel is up there is no way out except through it. But rules 31000
+and 31001 and table 52311 are owned by NetworkManager and are torn down the
+instant the connection goes down - at which point main's default route via the
+physical NIC is uncovered and every packet leaves in clear text. So `nmcli
+connection down` is not a brief drop, it is a brief total bypass. The old tray
+did exactly that on every state switch.
+
+WireGuard does not need a teardown to change peers. Swapping the peer on the
+live interface means the device never leaves, rules 31000/31001 are never torn
+down, and packets sent mid-swap hit the wg device and are dropped because no
+handshake exists yet. That is fail-closed by construction: the protection is
+the absence of a fallback route, not a rule someone has to remember to install.
+
+The private key is never read or written here. Only the peer changes.
+
+WHY NETPLAN IS WRITTEN BUT NOT APPLIED
+--------------------------------------
+`netplan apply` cycles the connection, which is the leak this avoids. The live
+swap is what takes effect now; the netplan write is only so a reboot comes back
+to the same server. Persistence is delegated to /usr/local/bin/nordvpn-repin,
+which owns the three-coordinated-edits problem (endpoint, keys.public, and the
+passthrough key literally NAMED wireguard-peer.<PUBKEY>.persistent-keepalive).
+Keeping one implementation of that is deliberate - an earlier sed version
+silently matched nothing against the real file.
+
+WHY THE STATE TABLE IS LOCAL
+----------------------------
+NordVPN has no concept of a state. Its geography is country -> city and the
+only coarser grouping is "The Americas". The table below was built by joining
+their US city list (55 cities) against state names; the join was exact in both
+directions and covers all 50 states. Only California, Missouri, New York and
+Texas have more than one city, so for most states this resolves to a single
+city and the real selection happens between servers inside it.
+
+Usage:
+  nordvpn-select --list                 print known states
+  nordvpn-select --status               current peer, its load, best available
+  nordvpn-select --state Colorado       switch to the best server in that state
+  nordvpn-select --poll                 hourly check: heal if dead, move only
+                                        if something is MARGIN points better
+
+Exit codes: 0 ok/changed, 1 nothing to do, 2 error.  Requires root.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+CONN = "nordvpn"
+IFACE = "nordvpn"
+PORT = 51820
+KEEPALIVE = 25
+REPIN = "/usr/local/bin/nordvpn-repin"
+STATE_FILE = "/var/lib/nordvpn-select/current-state"
+
+# REBALANCING THRESHOLDS
+#
+# Two conditions, both required, because either one alone misbehaves.
+#
+# FLOOR - do not consider moving at all until the current server is genuinely
+# loaded. NordVPN's "load" is a capacity indicator, not latency: a 5% server
+# and a 25% server are indistinguishable in use. Measured across Atlanta's 158
+# servers the spread was min 0%, median 10%, p90 16%, max 30% - so on a normal
+# day nothing there is congested and the correct action is none.
+#
+# MARGIN - once loaded, only move if the alternative is in a different class.
+# Without this it hops: you move to the 0% server, it climbs to 8% within the
+# hour, some other server is now at 0%, and it moves again forever.
+#
+# A margin alone does not work at any small value. Across 158 servers there is
+# almost always something 5 points better than wherever you are, so a margin of
+# 5 fires for 82% of servers - it reads restrictive and behaves as "always".
+# Only 20+ exceeds the everyday spread (fires for 7 of 158).
+#
+# THESE NUMBERS ARE REASONED, NOT MEASURED. They come from one snapshot, with
+# no data on how load moves across a day or whether the city spikes at peak
+# hours. Every poll decision is logged to DECISION_LOG so they can be tuned
+# from evidence later instead of from a guess.
+#
+# Neither threshold affects healing. A server that stops answering, or that
+# leaves NordVPN's list, is replaced immediately regardless of load - that is
+# the failure that actually breaks things, and it is unconditional.
+FLOOR = 45
+MARGIN = 20
+
+DECISION_LOG = "/var/log/nordvpn-select.log"
+
+
+# How long to wait for a real handshake before calling a server dead.
+HANDSHAKE_WAIT = 12
+HANDSHAKE_FRESH = 180
+
+STATES = {
+    'Alabama'           : [(8730710, 'Montgomery')],
+    'Alaska'            : [(8736005, 'Anchorage')],
+    'Arizona'           : [(8741960, 'Phoenix')],
+    'Arkansas'          : [(8749055, 'Little Rock')],
+    'California'        : [(8761958, 'Los Angeles'), (8766359, 'San Francisco')],
+    'Colorado'          : [(8770934, 'Denver')],
+    'Connecticut'       : [(8775974, 'New Haven')],
+    'Delaware'          : [(8781776, 'Wilmington')],
+    'Florida'           : [(8787782, 'Miami')],
+    'Georgia'           : [(8792429, 'Atlanta')],
+    'Hawaii'            : [(8808860, 'Honolulu')],
+    'Idaho'             : [(8810342, 'Boise')],
+    'Illinois'          : [(8815352, 'Chicago')],
+    'Indiana'           : [(8828528, 'Indianapolis')],
+    'Iowa'              : [(8835473, 'Des Moines')],
+    'Kansas'            : [(8845130, 'Wichita')],
+    'Kentucky'          : [(8852234, 'Louisville')],
+    'Louisiana'         : [(8863781, 'New Orleans')],
+    'Maine'             : [(8869646, 'Lewiston')],
+    'Maryland'          : [(8873894, 'Baltimore')],
+    'Massachusetts'     : [(8895305, 'Boston')],
+    'Michigan'          : [(8903312, 'Detroit')],
+    'Minnesota'         : [(8915105, 'Minneapolis')],
+    'Mississippi'       : [(8920961, 'Jackson')],
+    'Missouri'          : [(8930717, 'Kansas City'), (8934551, 'Saint Louis')],
+    'Montana'           : [(8937212, 'Billings')],
+    'Nebraska'          : [(8943887, 'Omaha')],
+    'Nevada'            : [(8945963, 'Las Vegas')],
+    'New Hampshire'     : [(8948549, 'Nashua')],
+    'New Jersey'        : [(8956166, 'Trenton')],
+    'New Mexico'        : [(8957066, 'Albuquerque')],
+    'New York'          : [(8963153, 'Buffalo'), (8971718, 'New York')],
+    'North Carolina'    : [(8980922, 'Charlotte')],
+    'North Dakota'      : [(8993042, 'Fargo')],
+    'Ohio'              : [(8997560, 'Columbus')],
+    'Oklahoma'          : [(9013061, 'Oklahoma City')],
+    'Oregon'            : [(9017738, 'Portland')],
+    'Pennsylvania'      : [(9036872, 'Pittsburgh')],
+    'Rhode Island'      : [(9048614, 'Providence')],
+    'South Carolina'    : [(9050567, 'Charleston')],
+    'South Dakota'      : [(9061658, 'Sioux Falls')],
+    'Tennessee'         : [(9071273, 'Nashville')],
+    'Texas'             : [(9080300, 'Dallas'), (9083687, 'Houston'), (9086162, 'McAllen')],
+    'Utah'              : [(9097865, 'Salt Lake City')],
+    'Vermont'           : [(9099731, 'Burlington')],
+    'Virginia'          : [(9103211, 'Ashburn')],
+    'Washington'        : [(9128402, 'Seattle')],
+    'West Virginia'     : [(9134528, 'Huntington')],
+    'Wisconsin'         : [(9144572, 'Milwaukee')],
+    'Wyoming'           : [(9147794, 'Cheyenne')],
+}
+
+
+def die(msg, code=2):
+    print(f"nordvpn-select: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+
+def log_decision(msg):
+    """Record every poll outcome, including the ones where nothing happened.
+
+    FLOOR and MARGIN were set from a single snapshot of one city. Logging the
+    decision each hour - current load, best available, and which gate stopped
+    it - turns tuning them into a question the data answers rather than one
+    more guess. The stay-put lines matter more than the moves: they are the
+    evidence that the thresholds are not simply set too high to ever fire.
+
+    Never fatal. A monitor that cannot write its log must still do its job.
+    """
+    try:
+        with open(DECISION_LOG, "a") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {msg}\n")
+    except OSError:
+        pass
+
+
+def need_root():
+    if os.geteuid() != 0:
+        die("must run as root (wg set and the netplan source both require it)")
+
+
+# ---------------------------------------------------------------- NordVPN API
+
+def recommendations(city_ids, limit=10):
+    """Live servers for a set of city ids, lowest load first.
+
+    The recommendations endpoint is unauthenticated - only the credentials
+    endpoint that returns the private key needs the access token. So this
+    keeps working even if the token is never rotated.
+    """
+    out = []
+    for cid in city_ids:
+        q = urllib.parse.urlencode({
+            "filters[country_city_id]": cid,
+            "filters[servers_technologies][identifier]": "wireguard_udp",
+            "limit": limit,
+        })
+        url = "https://api.nordvpn.com/v1/servers/recommendations?" + q
+        try:
+            with urllib.request.urlopen(url, timeout=20) as r:
+                data = json.load(r)
+        except Exception as e:
+            print(f"  warning: city {cid} lookup failed: {e}", file=sys.stderr)
+            continue
+        for s in data:
+            key = None
+            for t in s.get("technologies", []):
+                if t.get("identifier") == "wireguard_udp":
+                    for m in t.get("metadata", []):
+                        if m.get("name") == "public_key":
+                            key = m.get("value")
+            ip = s.get("station")
+            if not key or not ip:
+                continue
+            city = ""
+            try:
+                city = s["locations"][0]["country"]["city"]["name"]
+            except (KeyError, IndexError, TypeError):
+                pass
+            out.append({
+                "host": s.get("hostname", "?"),
+                "ip": ip,
+                "key": key,
+                "load": s.get("load", 100),
+                "city": city,
+            })
+    out.sort(key=lambda c: c["load"])
+    return out
+
+
+# ------------------------------------------------------------- live interface
+
+def wg_dump():
+    """Current peer straight off the kernel - the live truth, not the file.
+
+    Reading netplan would tell us what the config SAYS. After a live swap those
+    agree, but only the kernel knows what the tunnel is actually doing.
+    """
+    try:
+        r = subprocess.run(["wg", "show", IFACE, "dump"],
+                           capture_output=True, text=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    lines = [l for l in r.stdout.strip().split("\n") if l]
+    if len(lines) < 2:
+        return None
+    f = lines[1].split("\t")
+    return {
+        "key": f[0],
+        "endpoint": f[2] if len(f) > 2 else "",
+        "ip": f[2].rsplit(":", 1)[0] if len(f) > 2 and ":" in f[2] else "",
+        "handshake": int(f[4]) if len(f) > 4 and f[4].isdigit() else 0,
+    }
+
+
+def handshake_ok():
+    p = wg_dump()
+    if not p or not p["handshake"]:
+        return False
+    return (time.time() - p["handshake"]) < HANDSHAKE_FRESH
+
+
+def wait_handshake(seconds=HANDSHAKE_WAIT):
+    for _ in range(seconds):
+        if handshake_ok():
+            return True
+        time.sleep(1)
+    return False
+
+
+def swap_peer(new_ip, new_key, old_key):
+    """Replace the peer on the live interface. The device never goes down.
+
+    The new peer is added before the old one is removed. WireGuard requires
+    allowed-ips to be unique across peers, so claiming 0.0.0.0/0 for the new
+    peer takes it off the old one in the same operation - there is no window
+    where the tunnel has a default route pointing at a peer we are discarding.
+    """
+    subprocess.run(
+        ["wg", "set", IFACE,
+         "peer", new_key,
+         "endpoint", f"{new_ip}:{PORT}",
+         "allowed-ips", "0.0.0.0/0",
+         "persistent-keepalive", str(KEEPALIVE)],
+        check=True)
+    if old_key and old_key != new_key:
+        subprocess.run(["wg", "set", IFACE, "peer", old_key, "remove"], check=False)
+
+
+def persist(ip, key):
+    """Write the choice into the netplan SOURCE, without applying it.
+
+    Applying would cycle the connection and open the very clear-text window
+    the live swap exists to avoid. This only needs to be right by the next
+    reboot. nordvpn-repin owns the edit because the old peer key is embedded
+    in a passthrough key NAME and missing it leaves a stale peer behind.
+    """
+    if not os.path.exists(REPIN):
+        print(f"  warning: {REPIN} missing - change is live but will not survive reboot")
+        return
+    r = subprocess.run([REPIN, "--set", ip, key], capture_output=True, text=True)
+    if r.returncode == 2:
+        print(f"  warning: netplan not updated: {r.stderr.strip()}")
+    else:
+        print(f"  netplan updated for reboot persistence")
+
+
+# ------------------------------------------------------------------- selection
+
+def remembered_state():
+    try:
+        with open(STATE_FILE) as f:
+            s = f.read().strip()
+        return s if s in STATES else None
+    except OSError:
+        return None
+
+
+def remember_state(name):
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w") as f:
+            f.write(name + "\n")
+    except OSError as e:
+        print(f"  warning: could not record state: {e}")
+
+
+CITY_TO_STATE = {city: st for st, cs in STATES.items() for _, city in cs}
+
+_FULL = "unfetched"
+
+
+def full_list():
+    """Every live WireGuard server, keyed by endpoint IP.
+
+    WHY THIS IS SEPARATE FROM recommendations()
+    -------------------------------------------
+    Recommendations returns the top handful for a city - 10 out of Atlanta's
+    158. A perfectly healthy server that is merely not in today's top 10 is
+    absent from it. An earlier version tested retirement against that list,
+    which reported the live server carrying traffic (us13465, 8% load, status
+    online, 21-second-old handshake) as retired, and would have relocated the
+    tunnel off a working server every hour on that basis.
+
+    Retirement means absent from the FULL list. 212.102.45.117 is absent;
+    186.247.181.210 is present. That is the distinction that matters.
+
+    Returns None if the API could not be reached, which callers MUST treat as
+    "unknown" rather than "retired" - otherwise a network blip becomes an
+    unnecessary server switch.
+    """
+    global _FULL
+    if _FULL != "unfetched":
+        return _FULL
+    q = urllib.parse.urlencode({
+        "limit": 8000,
+        "filters[servers_technologies][identifier]": "wireguard_udp",
+    })
+    try:
+        with urllib.request.urlopen(
+                "https://api.nordvpn.com/v1/servers?" + q, timeout=40) as r:
+            data = json.load(r)
+    except Exception as e:
+        print(f"  warning: server list unreachable ({e})", file=sys.stderr)
+        _FULL = None
+        return None
+    out = {}
+    for s in data:
+        ip = s.get("station")
+        if not ip:
+            continue
+        city = country = ""
+        try:
+            country = s["locations"][0]["country"]["name"]
+            city = s["locations"][0]["country"]["city"]["name"]
+        except (KeyError, IndexError, TypeError):
+            pass
+        out[ip] = {
+            "host": s.get("hostname", "?"),
+            "load": s.get("load"),
+            "city": city,
+            "country": country,
+            "status": s.get("status", ""),
+        }
+    _FULL = out
+    return out
+
+
+def derive_state():
+    """Work out which state the live endpoint is in, instead of assuming one.
+
+    Nothing is stored per state except its name, so a fresh install has no
+    record until the first explicit --state switch, which would leave --poll
+    inert and --status unable to compare load. But the endpoint the tunnel is
+    already using appears in NordVPN's server list and every server carries
+    its city, so the state can be derived from the running tunnel rather than
+    guessed at.
+
+    Returns None for a server outside the US table. That is the correct
+    outcome, not a failure: it leaves --poll inert rather than relocating a
+    tunnel to a state nobody asked for.
+    """
+    cur = wg_dump()
+    if not cur or not cur["ip"]:
+        return None
+    full = full_list()
+    if not full:
+        return None
+    s = full.get(cur["ip"])
+    if not s or s["country"] != "United States":
+        return None
+    return CITY_TO_STATE.get(s["city"])
+
+
+def current_state():
+    """The recorded state, or one derived from the live tunnel.
+
+    Derived values are returned but never written to disk - only an explicit
+    --state records anything, so the file always reflects a decision that was
+    actually made rather than an inference.
+    """
+    name = remembered_state()
+    if name:
+        return name, False
+    return derive_state(), True
+
+
+def try_candidates(cands, old_key, label):
+    """Move onto the first candidate that actually answers.
+
+    The handshake is the test rather than an API query because it is ground
+    truth: it catches a retired server, a dead server, a blocked port and a
+    captive network identically. An API query only catches the first.
+    """
+    for c in cands:
+        print(f"  trying {c['host']} ({c['ip']}, {c['city']}, load {c['load']}%)")
+        try:
+            swap_peer(c["ip"], c["key"], old_key)
+        except subprocess.CalledProcessError as e:
+            print(f"    wg set failed: {e}")
+            continue
+        old_key = c["key"]
+        if wait_handshake():
+            print(f"  connected: {c['host']} ({c['ip']}) {label}")
+            persist(c["ip"], c["key"])
+            return 0
+        print(f"    no handshake - trying next")
+    print("  no candidate answered; tunnel is up but carrying nothing")
+    return 2
+
+
+def cmd_state(name):
+    if name not in STATES:
+        die(f"unknown state {name!r} - run --list")
+    cities = STATES[name]
+    print(f"{name}: {', '.join(c for _, c in cities)}")
+    cands = recommendations([cid for cid, _ in cities])
+    if not cands:
+        die("no live servers returned for that state")
+    cur = wg_dump()
+    old_key = cur["key"] if cur else ""
+    rc = try_candidates(cands, old_key, f"in {name}")
+    if rc == 0:
+        remember_state(name)
+    return rc
+
+
+def cmd_poll():
+    """Hourly check. Heals unconditionally, rebalances only past MARGIN."""
+    # Every path out of here logs, including the ones that do nothing. With an
+    # hourly timer a gap in the log is otherwise ambiguous between "the timer
+    # never fired" and "it ran and bailed early", and those need different
+    # fixes.
+    cur = wg_dump()
+    if not cur:
+        log_decision("SKIP (tunnel interface is not up)")
+        print("tunnel interface is not up - nothing to poll")
+        return 1
+    name, inferred = current_state()
+    if not name:
+        log_decision(f"SKIP ({cur['ip']}: state not recorded and not derivable)")
+        print("state neither recorded nor derivable from the endpoint - "
+              "leaving the tunnel alone")
+        return 1
+    if inferred:
+        print(f"state not recorded; derived {name} from endpoint {cur['ip']}")
+
+    cands = recommendations([cid for cid, _ in STATES[name]])
+    if not cands:
+        log_decision(f"SKIP ({name}: recommendations unavailable)")
+        print("recommendations unavailable - leaving the tunnel alone")
+        return 1
+
+    best = cands[0]
+
+    # Heal, case 1: no handshake. This is ground truth and outranks everything
+    # else - it catches a retired server, a dead server, a blocked port and a
+    # captive network identically, where an API query only catches the first.
+    if not handshake_ok():
+        log_decision(f"{name} {cur['ip']} HEAL (no handshake)")
+        print(f"{cur['ip']} is not answering - healing")
+        return try_candidates(cands, cur["key"], f"in {name}")
+
+    # Heal, case 2: the server has left NordVPN's FULL list, so it is being
+    # withdrawn even though it still answers right now. Checked against the
+    # full list and NOT against recommendations: recommendations returns 10 of
+    # Atlanta's 158, so a healthy server outside the top 10 looks retired and
+    # would be abandoned hourly for no reason.
+    #
+    # full_list() returns None when the API is unreachable. That must not read
+    # as retirement, or a network blip becomes a server switch.
+    full = full_list()
+    if full is None:
+        log_decision(f"{name} {cur['ip']} STAY (server list unreachable)")
+        print("server list unreachable - skipping the retirement check")
+        mine = None
+    else:
+        mine = full.get(cur["ip"])
+        if mine is None:
+            log_decision(f"{name} {cur['ip']} HEAL (left the server list)")
+            print(f"{cur['ip']} has left NordVPN's server list - healing")
+            return try_candidates(cands, cur["key"], f"in {name}")
+
+    # Rebalance: only when the current server is congested AND the alternative
+    # is in a different class. A swap keeps the interface up so nothing leaks,
+    # but the exit IP changes, so every live TCP flow still dies - including
+    # the archive collector's RPC sockets. That cost is why both gates exist.
+    if mine is None or mine["load"] is None:
+        log_decision(f"{name} {cur['ip']} load=? best={best['load']}% STAY (load unknown)")
+        print("current load unknown - staying put")
+        return 1
+
+    load = mine["load"]
+    gap = load - best["load"]
+    ctx = f"{name} {cur['ip']} load={load}% best={best['host']}@{best['load']}% gap={gap}"
+
+    if load < FLOOR:
+        log_decision(f"{ctx} STAY (load < floor {FLOOR})")
+        print(f"{cur['ip']} at {load}% - below the {FLOOR}% floor, "
+              f"nothing to gain by moving")
+        return 1
+
+    if gap < MARGIN:
+        log_decision(f"{ctx} STAY (gap < margin {MARGIN})")
+        print(f"{cur['ip']} at {load}% is loaded, but the best is {best['load']}% "
+              f"(gap {gap} < {MARGIN}) - not worth the reconnect")
+        return 1
+
+    log_decision(f"{ctx} MOVE (load >= {FLOOR} and gap >= {MARGIN})")
+    print(f"{cur['ip']} at {load}% vs {best['host']} at {best['load']}% "
+          f"- congested and a materially better server exists, moving")
+    return try_candidates([best], cur["key"], f"in {name}")
+
+
+def cmd_status():
+    cur = wg_dump()
+    if not cur:
+        print("state    : (interface is not up)")
+        print("peer     : interface is not up")
+        return 1
+    name, inferred = current_state()
+    print(f"state    : {name or 'not recorded'}"
+          f"{'   (derived from endpoint, not recorded)' if name and inferred else ''}")
+    age = int(time.time() - cur["handshake"]) if cur["handshake"] else None
+    print(f"endpoint : {cur['endpoint']}")
+    print(f"peer key : {cur['key']}")
+    print(f"handshake: {str(age) + 's ago' if age is not None else 'NEVER'}"
+          f"{'' if handshake_ok() else '   <- TUNNEL IS NOT CARRYING TRAFFIC'}")
+    # Current server's identity and load come from the FULL list. Absent from
+    # it means genuinely retired; absent from recommendations means only that
+    # it is outside the top 10 of its city, which says nothing about health.
+    full = full_list()
+    if full is None:
+        print("server   : (server list unreachable)")
+    else:
+        mine = full.get(cur["ip"])
+        if mine is None:
+            print(f"server   : NOT IN NORDVPN'S LIST - retired or withdrawn")
+        else:
+            print(f"server   : {mine['host']}  {mine['city']}  "
+                  f"load {mine['load']}%  status {mine['status']}")
+    if name:
+        cands = recommendations([cid for cid, _ in STATES[name]])
+        if cands:
+            b = cands[0]
+            print(f"best     : {b['host']} ({b['ip']}) {b['city']} {b['load']}% "
+                  f"in {name}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--list", action="store_true", help="print known states")
+    g.add_argument("--status", action="store_true", help="current peer and load")
+    g.add_argument("--state", metavar="NAME", help="switch to the best server in this state")
+    g.add_argument("--poll", action="store_true", help="hourly heal/rebalance check")
+    a = ap.parse_args()
+
+    if a.list:
+        for s in sorted(STATES):
+            print(s)
+        return 0
+
+    need_root()
+    if a.status:
+        return cmd_status()
+    if a.state:
+        return cmd_state(a.state)
+    return cmd_poll()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

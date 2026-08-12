@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+/usr/local/bin/nordvpn-repin
+
+Swap the nordvpn WireGuard peer to a live server, editing the netplan SOURCE file.
+
+WHY A PARSER AND NOT sed
+------------------------
+The first attempt used sed. Against the real file every pattern silently matched
+nothing: the values are quoted, and the peer key is `public:` nested under
+`keys:`, not `public-key:`. That version would have logged five attempts, changed
+nothing, retried the same dead server five times and reported failure - hiding the
+fault behind the appearance of work. A parser either finds the field or raises.
+
+THREE COORDINATED EDITS, NOT ONE
+--------------------------------
+  1. network.tunnels.nordvpn.peers[0].endpoint        "IP:51820"
+  2. network.tunnels.nordvpn.peers[0].keys.public      the peer public key
+  3. the passthrough key literally NAMED
+     "wireguard-peer.<OLD_PUBKEY>.persistent-keepalive"
+     The old public key is embedded in that key NAME. Miss it and NetworkManager
+     carries a stale peer entry alongside the new one.
+
+WHY NETPLAN AND NOT THE RENDERED FILE
+-------------------------------------
+The connection is netplan-owned. Anything written to
+/run/NetworkManager/system-connections/ is destroyed by the next `netplan apply`
+or reboot. Editing the source is what makes a fix survive.
+
+Usage:
+  nordvpn-repin --show               print the current endpoint and peer key
+  nordvpn-repin --check              is the current endpoint still in NordVPN's list?
+  nordvpn-repin --set IP PUBKEY      swap to a specific server
+
+Exit codes: 0 = ok/changed, 1 = no change needed / not live, 2 = error.
+Requires root (the netplan file is root-only).
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import urllib.parse
+import urllib.request
+
+NETPLAN = "/etc/netplan/90-NM-426ddfbc-6b88-403d-b66d-d2bc1e9cfe28.yaml"
+PORT = 51820
+TOKEN_FILE = "/home/zenko/.nordvpn-token.sh"
+KA_PREFIX = "wireguard-peer."
+KA_SUFFIX = ".persistent-keepalive"
+
+
+def die(msg, code=2):
+    print(f"nordvpn-repin: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load():
+    try:
+        import yaml
+    except ImportError:
+        die("python3-yaml not installed  ->  sudo apt install python3-yaml")
+    try:
+        with open(NETPLAN) as f:
+            return yaml, yaml.safe_load(f)
+    except PermissionError:
+        die(f"needs root to read {NETPLAN}")
+    except FileNotFoundError:
+        die(f"{NETPLAN} does not exist")
+
+
+def peer_of(doc):
+    """Locate the peer, failing loudly rather than guessing at a changed shape."""
+    try:
+        tun = doc["network"]["tunnels"]["nordvpn"]
+    except (KeyError, TypeError):
+        die("network.tunnels.nordvpn not found - wrong file?")
+    peers = tun.get("peers")
+    if not peers:
+        die("no peers[] under the nordvpn tunnel")
+    if len(peers) != 1:
+        die(f"expected exactly 1 peer, found {len(peers)} - refusing to guess")
+    p = peers[0]
+    if "endpoint" not in p or "keys" not in p or "public" not in p.get("keys", {}):
+        die("peer missing endpoint or keys.public - file shape has changed")
+    return tun, p
+
+
+def current(doc):
+    _, p = peer_of(doc)
+    return p["endpoint"].rsplit(":", 1)[0], p["keys"]["public"]
+
+
+def token():
+    try:
+        with open(TOKEN_FILE) as f:
+            for line in f:
+                if "NORDVPN_ACCESS_TOKEN" in line and "=" in line:
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        die(f"cannot read {TOKEN_FILE}")
+    die(f"NORDVPN_ACCESS_TOKEN not found in {TOKEN_FILE}")
+
+
+def api(path, tok):
+    req = urllib.request.Request(
+        "https://api.nordvpn.com" + path,
+        headers={"Authorization": f"token:{tok}"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def set_peer(new_ip, new_key):
+    yaml, doc = load()
+    tun, p = peer_of(doc)
+    old_ip, old_key = current(doc)
+
+    if (old_ip, old_key) == (new_ip, new_key):
+        print(f"already pinned to {new_ip} - nothing to do")
+        return 1
+
+    p["endpoint"] = f"{new_ip}:{PORT}"
+    p["keys"]["public"] = new_key
+
+    pt = tun.get("networkmanager", {}).get("passthrough", {})
+    old_name = KA_PREFIX + old_key + KA_SUFFIX
+    new_name = KA_PREFIX + new_key + KA_SUFFIX
+    if old_name in pt:
+        pt[new_name] = pt.pop(old_name)
+    else:
+        stale = [k for k in pt if k.startswith(KA_PREFIX) and k.endswith(KA_SUFFIX)]
+        if stale:
+            die(f"expected passthrough key for the old peer, found {stale} - refusing to guess")
+        # None present at all is survivable; keepalive simply isn't configured.
+
+    shutil.copy2(NETPLAN, NETPLAN + ".bak")
+    with open(NETPLAN, "w") as f:
+        yaml.safe_dump(doc, f, default_flow_style=False, sort_keys=False)
+    os.chmod(NETPLAN, 0o600)
+
+    print(f"{old_ip} -> {new_ip}")
+    print(f"backup: {NETPLAN}.bak")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--show", action="store_true", help="print current endpoint and peer key")
+    g.add_argument("--check", action="store_true", help="is the pinned server still listed?")
+    g.add_argument("--set", nargs=2, metavar=("IP", "PUBKEY"), help="swap to this server")
+    a = ap.parse_args()
+
+    if a.show:
+        _, doc = load()
+        ip, key = current(doc)
+        print(f"endpoint : {ip}:{PORT}")
+        print(f"peer key : {key}")
+        return 0
+
+    if a.check:
+        _, doc = load()
+        ip, _ = current(doc)
+        q = urllib.parse.urlencode(
+            {"limit": "8000",
+             "filters[servers_technologies][identifier]": "wireguard_udp"}
+        )
+        servers = api("/v1/servers?" + q, token())
+        live = {s.get("station") for s in servers}
+        if ip in live:
+            print(f"{ip} is still in NordVPN's server list")
+            return 0
+        print(f"{ip} is NOT in NordVPN's list - retired or withdrawn")
+        return 1
+
+    return set_peer(a.set[0], a.set[1])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
