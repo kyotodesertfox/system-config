@@ -1,0 +1,40 @@
+[Unit]
+Description=Load the NordVPN kill switch before any network exists
+Documentation=file:///home/zenko/github/system-config/README.md
+
+# Load BEFORE network-pre.target, which is the ordering point everything else
+# that configures networking sits after. By the time NetworkManager, DHCP or
+# any interface comes up, the ruleset is already in place - so there is no
+# window at boot where traffic could leave before the switch is armed.
+Before=network-pre.target
+Wants=network-pre.target
+
+# No default dependencies: this must run early, before basic.target, and must
+# not wait on anything that itself waits on the network.
+DefaultDependencies=no
+After=local-fs.target
+Requires=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# The ruleset is idempotent - it deletes and recreates its own table - so a
+# reload at any point produces exactly one copy rather than stacking.
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/nordvpn-killswitch.nft
+
+# If the ruleset fails to load, the machine would otherwise boot UNARMED and
+# nothing would say so. Fail closed instead: drop all egress outright. Ugly and
+# deliberate - a machine with no network is recoverable, a machine silently
+# leaking is not.
+ExecStartPost=/bin/sh -c 'nft list table inet killswitch >/dev/null 2>&1 || \
+  nft add table inet ks_panic; \
+  nft list table inet killswitch >/dev/null 2>&1 || \
+  nft add chain inet ks_panic output "{ type filter hook output priority 0; policy drop; }"'
+
+# Removing the table on stop would disarm on shutdown, which is harmless but
+# pointless. Leave it - the kernel discards it at poweroff anyway.
+ExecStop=/bin/true
+
+[Install]
+WantedBy=sysinit.target

@@ -1,3 +1,5 @@
 *.log
 *.bak
 .pat_*
+__pycache__/
+*.pyc

@@ -8,6 +8,13 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/sbin/nordvpn-select --poll
 
+# Refresh the kill switch's API address set while the tunnel is healthy. The
+# addresses are Cloudflare's and they rotate; if the set goes stale, recovery
+# from a retired server is impossible at the moment it is needed. The refresh
+# refuses to run when traffic is not routing through the tunnel, so it can
+# never cache an answer obtained outside it.
+ExecStartPost=-/usr/local/sbin/nordvpn-api-refresh
+
 # A poll that hangs must not stack up behind the next one.
 TimeoutStartSec=180
 

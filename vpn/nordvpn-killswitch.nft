@@ -41,6 +41,18 @@
 # TO REMOVE:   nft delete table inet killswitch
 # TO INSPECT:  nft list table inet killswitch
 
+# IDEMPOTENCY. `nft -f` APPENDS to an existing table rather than replacing it,
+# so loading this twice stacks a second complete copy of every rule. Observed
+# live 2026-08-12 after five arms: five identical rule sets in one chain, five
+# separate drop counters, and a table that grows every time it is loaded.
+#
+# The bare `table` line creates it if absent so the delete cannot fail, then the
+# delete clears whatever was there, then the definition below builds it fresh.
+# Loading this file any number of times now produces exactly one ruleset.
+
+table inet killswitch
+delete table inet killswitch
+
 table inet killswitch {
 
   # Populated by nordvpn-api-refresh. Empty here on purpose - a stale hardcoded
@@ -72,6 +84,13 @@ table inet killswitch {
     # DHCP client - needed to get an address on the physical NIC at all.
     udp sport 68 udp dport 67 accept
 
+    # Log what is dropped, rate limited so a misbehaving process cannot flood
+    # the journal. Read with:
+    #   sudo journalctl -k -g "ks-out" --since "10 min ago"
+    # Each line carries OUT=, SRC=, DST=, PROTO= and DPT=, which is enough to
+    # identify exactly what is trying to leave outside the tunnel.
+    limit rate 20/minute burst 10 packets log prefix "ks-out: " level info
+
     counter comment "dropped-egress"
   }
 
@@ -85,6 +104,8 @@ table inet killswitch {
     # Traffic staying on the local bridges never leaves the host.
     iifname "docker0"         oifname "docker0"         accept
     iifname "br-41a69b83588d" oifname "br-41a69b83588d" accept
+
+    limit rate 20/minute burst 10 packets log prefix "ks-fwd: " level info
 
     counter comment "dropped-forward"
   }

@@ -130,7 +130,9 @@ def killswitch_armed():
     """None means the tool is not installed - distinct from 'not armed'."""
     if KILLSWITCH is None:
         return None
-    r = run([KILLSWITCH, 'status'], timeout=10)
+    # nft list table needs root, so this MUST go through sudo. Without it
+    # the check always fails and reports 'disarmed' whatever the truth is.
+    r = run(['sudo', '-n', KILLSWITCH, 'status'], timeout=10)
     if r.returncode == 1:
         return False
     if r.returncode == 0:
@@ -198,6 +200,45 @@ def do_unprotected():
         run(['sudo', '-n', KILLSWITCH, 'disarm'])
 
 
+def notify(title, body, urgency='normal'):
+    """Desktop notification. Never fatal - a missing notifier must not break
+    the toggle it is reporting on."""
+    run(['notify-send', '-u', urgency, '-a', 'NordVPN', title, body], timeout=10)
+
+
+def set_markup(item, markup, plain):
+    """Colour the menu label. Falls back to plain text if markup is refused,
+    because a menu that fails to render is worse than one without colour."""
+    try:
+        item.get_child().set_markup(markup)
+    except Exception:
+        item.set_label(plain)
+
+
+def do_toggle_killswitch():
+    """Explicit arm/disarm, because the implicit version is unmemorable.
+
+    Arming also happens on connect, but there was no way to arm without
+    connecting and no way to see the state without reading a menu label
+    carefully. A switch you cannot find is a switch you will not use.
+    """
+    if not KILLSWITCH_PRESENT:
+        return
+    action = 'disarm' if killswitch_armed() else 'arm'
+    r = run(['sudo', '-n', KILLSWITCH, action])
+    now = killswitch_armed()
+    if now is True:
+        notify('Kill switch ARMED',
+               'Traffic outside the tunnel is blocked. LAN still reachable.',
+               'normal')
+    elif now is False:
+        notify('Kill switch OFF',
+               'Traffic can leave outside the tunnel. Clear text.',
+               'critical')
+    else:
+        notify('Kill switch', f'state unknown: {r.stderr.strip() or r.stdout.strip()}', 'critical')
+
+
 def do_reconnect():
     if KILLSWITCH_PRESENT:
         run(['sudo', '-n', KILLSWITCH, 'arm'])
@@ -220,7 +261,7 @@ def states():
 
 
 def set_busy(busy):
-    for item in (connect_item, disconnect_item, unprotected_item, state_item):
+    for item in (connect_item, disconnect_item, unprotected_item, state_item, killswitch_item):
         item.set_sensitive(not busy)
     if busy:
         status_item.set_label('working...')
@@ -245,7 +286,16 @@ def refresh():
             text = 'UNPROTECTED - clear text'
 
     indicator.set_icon_full(icon, 'NordVPN')
-    status_item.set_label(text)
+    status_item.set_label(('\U0001F7E2  ' if st == 'routed' else '\U0001F534  ') + text)
+
+    # Emoji rather than pango markup: GTK themes routinely override foreground
+    # colour on menu items, which rendered the coloured dot plain white.
+    if armed is True:
+        killswitch_item.set_label('\U0001F7E2  Kill switch ON')
+    elif armed is False:
+        killswitch_item.set_label('\U0001F534  Kill switch OFF')
+    else:
+        killswitch_item.set_label('\u26AA  Kill switch unavailable')
 
     connect_item.set_sensitive(st != 'routed')
     disconnect_item.set_sensitive(st == 'routed')
@@ -288,6 +338,11 @@ state_item = Gtk.MenuItem(label='Connect by State')
 state_item.set_submenu(state_menu)
 state_item.set_sensitive(bool(_names))
 menu.append(state_item)
+
+killswitch_item = Gtk.MenuItem(label='Kill switch')
+killswitch_item.connect('activate', in_worker(do_toggle_killswitch))
+killswitch_item.set_sensitive(KILLSWITCH_PRESENT)
+menu.append(killswitch_item)
 
 connect_item = Gtk.MenuItem(label='Reconnect')
 connect_item.connect('activate', in_worker(do_reconnect))

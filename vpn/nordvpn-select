@@ -354,57 +354,79 @@ CITY_TO_STATE = {city: st for st, cs in STATES.items() for _, city in cs}
 _FULL = "unfetched"
 
 
-def full_list():
-    """Every live WireGuard server, keyed by endpoint IP.
+def full_list(_city_ids=None):
+    """Every US WireGuard server, keyed by endpoint IP. Complete, not truncated.
 
-    WHY THIS IS SEPARATE FROM recommendations()
-    -------------------------------------------
-    Recommendations returns the top handful for a city - 10 out of Atlanta's
-    158. A perfectly healthy server that is merely not in today's top 10 is
-    absent from it. An earlier version tested retirement against that list,
-    which reported the live server carrying traffic (us13465, 8% load, status
-    online, 21-second-old handshake) as retired, and would have relocated the
-    tunnel off a working server every hour on that basis.
+    WHY NOT recommendations()
+    -------------------------
+    Recommendations returns the top handful for a city - 10 of Atlanta's 158.
+    A healthy server outside today's top 10 is absent from it, and an earlier
+    version treated that absence as retirement.
 
-    Retirement means absent from the FULL list. 212.102.45.117 is absent;
-    186.247.181.210 is present. That is the distinction that matters.
+    WHY COUNTRY-SCOPED, AND WHY THE LIMIT MATTERS
+    ---------------------------------------------
+    An earlier version asked for `limit=8000` unfiltered and called the result
+    "every server". It is not - the API returns EXACTLY 8000 and truncates.
+    Observed live 2026-08-12: endpoint 187.15.145.62 was reported "NOT IN
+    NORDVPN'S LIST - retired or withdrawn" while simultaneously being named the
+    BEST server in its own state. Left alone it would have healed the tunnel
+    off a good server every hour, forever.
 
-    Returns None if the API could not be reached, which callers MUST treat as
-    "unknown" rather than "retired" - otherwise a network blip becomes an
-    unnecessary server switch.
+    /v1/servers does NOT support filters[country_city_id] - passing it returns
+    zero results, which would make every server look retired. It does support
+    filters[country_id]. US (228) returns 3028 servers, so limit=5000 is
+    complete with headroom, and every state in STATES is US.
+
+    TRUNCATION IS DETECTED, NOT ASSUMED. If the response length equals the
+    limit the list is incomplete, and this returns None - "unknown" - rather
+    than an authoritative-looking partial answer. That is the specific failure
+    that produced the bug twice.
+
+    Returns None if unreachable or truncated. Callers MUST treat None as
+    unknown rather than retired.
     """
     global _FULL
     if _FULL != "unfetched":
         return _FULL
+
+    LIMIT = 5000
     q = urllib.parse.urlencode({
-        "limit": 8000,
+        "limit": LIMIT,
         "filters[servers_technologies][identifier]": "wireguard_udp",
+        "filters[country_id]": 228,
     })
     try:
         with urllib.request.urlopen(
-                "https://api.nordvpn.com/v1/servers?" + q, timeout=40) as r:
+                "https://api.nordvpn.com/v1/servers?" + q, timeout=60) as r:
             data = json.load(r)
     except Exception as e:
         print(f"  warning: server list unreachable ({e})", file=sys.stderr)
         _FULL = None
         return None
+
+    if len(data) >= LIMIT:
+        print(f"  warning: server list TRUNCATED at {len(data)} - treating as unknown",
+              file=sys.stderr)
+        _FULL = None
+        return None
+
     out = {}
-    for s in data:
-        ip = s.get("station")
+    for srv in data:
+        ip = srv.get("station")
         if not ip:
             continue
         city = country = ""
         try:
-            country = s["locations"][0]["country"]["name"]
-            city = s["locations"][0]["country"]["city"]["name"]
+            country = srv["locations"][0]["country"]["name"]
+            city = srv["locations"][0]["country"]["city"]["name"]
         except (KeyError, IndexError, TypeError):
             pass
         out[ip] = {
-            "host": s.get("hostname", "?"),
-            "load": s.get("load"),
+            "host": srv.get("hostname", "?"),
+            "load": srv.get("load"),
             "city": city,
             "country": country,
-            "status": s.get("status", ""),
+            "status": srv.get("status", ""),
         }
     _FULL = out
     return out
@@ -590,7 +612,7 @@ def cmd_status():
     print(f"peer key : {cur['key']}")
     print(f"handshake: {str(age) + 's ago' if age is not None else 'NEVER'}"
           f"{'' if handshake_ok() else '   <- TUNNEL IS NOT CARRYING TRAFFIC'}")
-    # Current server's identity and load come from the FULL list. Absent from
+    # Current server's identity and load come from the city-scoped list. Absent from
     # it means genuinely retired; absent from recommendations means only that
     # it is outside the top 10 of its city, which says nothing about health.
     full = full_list()
